@@ -1,0 +1,167 @@
+name: OpenCC zhTW from upstream release and publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_repo:
+        description: "Upstream repo (owner/name)"
+        required: true
+        default: "chinosk6/GakumasTranslationData"
+      upstream_tag:
+        description: "Optional: specify upstream release tag (leave empty = latest)"
+        required: false
+        default: ""
+      asset_name:
+        description: "Release asset filename to download from upstream"
+        required: true
+        default: "GakumasTranslationData.zip"
+      opencc_config:
+        description: "OpenCC config (s2t.json / s2tw.json / s2twp.json / s2hk.json)"
+        required: true
+        default: "s2twp.json"
+      release_tag_prefix:
+        description: "Tag prefix for your repo release"
+        required: true
+        default: "zhTW-"
+      if_exists:
+        description: "If release tag already exists in your repo"
+        required: true
+        type: choice
+        options:
+          - skip
+          - update
+        default: "update"
+
+  # 可選：自動追上游（每 12 小時跑一次）
+  # schedule:
+  #   - cron: "0 */12 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  build_and_release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout (for release tag commit reference)
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y opencc unzip zip jq
+
+      - name: Resolve upstream release + download asset
+        id: upstream
+        env:
+          UPSTREAM_REPO: ${{ inputs.upstream_repo }}
+          UPSTREAM_TAG: ${{ inputs.upstream_tag }}
+          ASSET_NAME: ${{ inputs.asset_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          API="https://api.github.com/repos/${UPSTREAM_REPO}/releases"
+          if [ -n "${UPSTREAM_TAG}" ]; then
+            URL="${API}/tags/${UPSTREAM_TAG}"
+          else
+            URL="${API}/latest"
+          fi
+
+          echo "Fetching upstream release metadata: ${URL}"
+          JSON="$(curl -sL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "${URL}")"
+
+          TAG="$(echo "$JSON" | jq -r '.tag_name // empty')"
+          if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+            echo "Failed to read upstream tag_name"
+            echo "$JSON" | head -c 2000
+            exit 1
+          fi
+
+          DL="$(echo "$JSON" | jq -r --arg NAME "$ASSET_NAME" '.assets[]? | select(.name==$NAME) | .browser_download_url' | head -n 1)"
+          if [ -z "$DL" ] || [ "$DL" = "null" ]; then
+            echo "Asset not found: ${ASSET_NAME}"
+            echo "Upstream assets are:"
+            echo "$JSON" | jq -r '.assets[].name'
+            exit 1
+          fi
+
+          echo "upstream_tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "download_url=$DL" >> "$GITHUB_OUTPUT"
+
+          mkdir -p work
+          echo "Downloading: $DL"
+          curl -L --fail -o work/input.zip "$DL"
+
+      - name: Unzip
+        run: |
+          set -euo pipefail
+          rm -rf work/extracted
+          mkdir -p work/extracted
+          unzip -q work/input.zip -d work/extracted
+
+      - name: Convert .txt/.json with OpenCC
+        env:
+          CONFIG: ${{ inputs.opencc_config }}
+        run: |
+          set -euo pipefail
+          echo "Using OpenCC config: ${CONFIG}"
+
+          find work/extracted -type f \( -name "*.txt" -o -name "*.json" \) -print0 \
+            | while IFS= read -r -d '' f; do
+                tmp="${f}.tmp"
+                opencc -i "$f" -o "$tmp" -c "$CONFIG"
+                mv "$tmp" "$f"
+              done
+
+      - name: Pack output zip + compute release tag
+        id: pack
+        env:
+          CONFIG: ${{ inputs.opencc_config }}
+          UP_TAG: ${{ steps.upstream.outputs.upstream_tag }}
+          PREFIX: ${{ inputs.release_tag_prefix }}
+        run: |
+          set -euo pipefail
+          CONFIG_BASE="$(basename "$CONFIG" .json)"
+          REL_TAG="${PREFIX}${UP_TAG}-${CONFIG_BASE}"
+          OUT_ZIP="GakumasTranslationData_${REL_TAG}.zip"
+
+          (cd work/extracted && zip -qr "../${OUT_ZIP}" .)
+
+          echo "release_tag=${REL_TAG}" >> "$GITHUB_OUTPUT"
+          echo "zip_path=work/${OUT_ZIP}" >> "$GITHUB_OUTPUT"
+          echo "zip_name=${OUT_ZIP}" >> "$GITHUB_OUTPUT"
+
+      - name: Check if release exists (skip mode)
+        if: ${{ inputs.if_exists == 'skip' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.pack.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists. Skipping."
+            echo "SKIP_RELEASE=1" >> "$GITHUB_ENV"
+          fi
+
+      - name: Publish GitHub Release (attach zip)
+        if: ${{ env.SKIP_RELEASE != '1' }}
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ steps.pack.outputs.release_tag }}
+          name: "OpenCC zhTW - upstream ${{ steps.upstream.outputs.upstream_tag }} (${{ inputs.opencc_config }})"
+          commit: ${{ github.ref_name }}
+          allowUpdates: true
+          removeArtifacts: true
+          replacesArtifacts: true
+          artifacts: ${{ steps.pack.outputs.zip_path }}
+          artifactContentType: application/zip
+          body: |
+            Upstream: https://github.com/${{ inputs.upstream_repo }}/releases/tag/${{ steps.upstream.outputs.upstream_tag }}
+            Upstream asset: ${{ steps.upstream.outputs.download_url }}
+            OpenCC config: ${{ inputs.opencc_config }}
+            Generated by GitHub Actions.
