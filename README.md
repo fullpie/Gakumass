@@ -1,4 +1,4 @@
-# Gakumass（自動更新繁體版翻譯資料）
+# Gakumass學園偶像大師漢化（自動更新繁體版翻譯資料）
 
 本專案會自動從上游 GitHub Release 下載 `GakumasTranslationData.zip`，使用 **OpenCC** 轉換為 **繁體中文（zhTW）**，再把結果打包成 `GakumasTranslationData_zhTW.zip` 並發佈到本 repo 的 **Release**。
 
